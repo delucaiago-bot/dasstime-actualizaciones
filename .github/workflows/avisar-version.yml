@@ -1,0 +1,66 @@
+# Envía un aviso push (Firebase Cloud Messaging, topic "updates") a todas las apps cuando se publica
+# una versión nueva. Va en el repositorio de versiones: .github/workflows/avisar-version.yml
+#
+# Necesita el secreto FIREBASE_SERVICE_ACCOUNT con el JSON de la cuenta de servicio del proyecto de
+# Firebase (Configuración del proyecto > Cuentas de servicio > Generar nueva clave privada).
+# También se puede lanzar a mano (pestaña Actions) para reenviar el aviso de la última versión.
+name: Avisar versión nueva
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  avisar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Datos de la versión
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            cp "$GITHUB_EVENT_PATH" event.json
+            jq '.release' event.json > release.json
+          else
+            gh api "repos/${{ github.repository }}/releases/latest" > release.json
+          fi
+          # El APK se llama dasstime-movil-<versión>-<código>.apk (como lo busca la app).
+          ASSET=$(jq -r '.assets[].name' release.json | grep -E '^dasstime-movil-.+-[0-9]+\.apk$' | head -n1)
+          if [ -z "$ASSET" ]; then echo "La release no tiene el APK dasstime-movil-*.apk"; exit 1; fi
+          echo "name=$(echo "$ASSET" | sed -E 's/^dasstime-movil-(.+)-([0-9]+)\.apk$/\1/')" >> "$GITHUB_OUTPUT"
+          echo "code=$(echo "$ASSET" | sed -E 's/^dasstime-movil-(.+)-([0-9]+)\.apk$/\2/')" >> "$GITHUB_OUTPUT"
+
+      - name: Enviar aviso
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          VERSION_NAME: ${{ steps.release.outputs.name }}
+          VERSION_CODE: ${{ steps.release.outputs.code }}
+        run: |
+          set -euo pipefail
+          EMAIL=$(jq -r .client_email <<<"$SA")
+          PROJECT=$(jq -r .project_id <<<"$SA")
+          umask 077
+          jq -r .private_key <<<"$SA" > key.pem
+
+          # Token OAuth de la cuenta de servicio (JWT firmado con RS256), sin dependencias extra.
+          b64() { openssl base64 -e -A | tr '+/' '-_' | tr -d '='; }
+          NOW=$(date +%s)
+          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+          CLAIMS=$(jq -cn --arg iss "$EMAIL" --argjson iat "$NOW" \
+            '{iss:$iss, scope:"https://www.googleapis.com/auth/firebase.messaging", aud:"https://oauth2.googleapis.com/token", iat:$iat, exp:($iat+3600)}' | b64)
+          SIG=$(printf '%s.%s' "$HEADER" "$CLAIMS" | openssl dgst -sha256 -sign key.pem | b64)
+          rm -f key.pem
+          TOKEN=$(curl -sS --fail-with-body https://oauth2.googleapis.com/token \
+            -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer -d assertion="$HEADER.$CLAIMS.$SIG" | jq -r .access_token)
+
+          # Mensaje de datos: la app decide si mostrarlo (solo si la versión es más nueva que la instalada).
+          NOTES=$(jq -r '.body // ""' release.json | head -c 900)
+          BODY=$(jq -cn --arg name "$VERSION_NAME" --arg code "$VERSION_CODE" --arg notes "$NOTES" \
+            '{message:{topic:"updates", android:{priority:"high"}, data:{type:"update", versionName:$name, versionCode:$code, notes:$notes}}}')
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            "https://fcm.googleapis.com/v1/projects/$PROJECT/messages:send" -d "$BODY"
+          echo
+          echo "Aviso enviado: versión $VERSION_NAME (código $VERSION_CODE)"
