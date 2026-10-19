@@ -1,18 +1,29 @@
-# Envía un aviso push (Firebase Cloud Messaging, topic "updates") a todas las apps cuando se publica
-# una versión nueva. Va en el repositorio de versiones: .github/workflows/avisar-version.yml
+# Envía un aviso push (Firebase Cloud Messaging) cuando se publica una versión nueva. Va en el
+# repositorio de versiones: .github/workflows/avisar-version.yml
+#
+# Dos canales:
+# - Pre-release publicada (canal de pruebas) -> topic "updates-test": solo los móviles con el canal
+#   de pruebas activado.
+# - Release normal publicada, o pre-release que pasa a normal -> topic "updates": todos.
 #
 # Necesita el secreto FIREBASE_SERVICE_ACCOUNT con el JSON de la cuenta de servicio del proyecto de
 # Firebase (Configuración del proyecto > Cuentas de servicio > Generar nueva clave privada).
-# También se puede lanzar a mano (pestaña Actions) para reenviar el aviso de la última versión.
+# También se puede lanzar a mano (pestaña Actions) para reenviar el aviso de la última versión normal.
 name: Avisar versión nueva
 
 on:
   release:
-    types: [published]
+    # "published" salta con cualquier versión publicada y "released" con una normal o una pre-release
+    # que pasa a normal. El "if" deja un solo aviso por versión y canal.
+    types: [published, released]
   workflow_dispatch:
 
 jobs:
   avisar:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'released' ||
+      (github.event.action == 'published' && github.event.release.prerelease)
     runs-on: ubuntu-latest
     steps:
       - name: Datos de la versión
@@ -31,12 +42,14 @@ jobs:
           if [ -z "$ASSET" ]; then echo "La release no tiene el APK dasstime-movil-*.apk"; exit 1; fi
           echo "name=$(echo "$ASSET" | sed -E 's/^dasstime-movil-(.+)-([0-9]+)\.apk$/\1/')" >> "$GITHUB_OUTPUT"
           echo "code=$(echo "$ASSET" | sed -E 's/^dasstime-movil-(.+)-([0-9]+)\.apk$/\2/')" >> "$GITHUB_OUTPUT"
+          echo "topic=$(jq -r 'if .prerelease then "updates-test" else "updates" end' release.json)" >> "$GITHUB_OUTPUT"
 
       - name: Enviar aviso
         env:
           SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           VERSION_NAME: ${{ steps.release.outputs.name }}
           VERSION_CODE: ${{ steps.release.outputs.code }}
+          TOPIC: ${{ steps.release.outputs.topic }}
         run: |
           set -euo pipefail
           EMAIL=$(jq -r .client_email <<<"$SA")
@@ -57,10 +70,10 @@ jobs:
 
           # Mensaje de datos: la app decide si mostrarlo (solo si la versión es más nueva que la instalada).
           NOTES=$(jq -r '.body // ""' release.json | head -c 900)
-          BODY=$(jq -cn --arg name "$VERSION_NAME" --arg code "$VERSION_CODE" --arg notes "$NOTES" \
-            '{message:{topic:"updates", android:{priority:"high"}, data:{type:"update", versionName:$name, versionCode:$code, notes:$notes}}}')
+          BODY=$(jq -cn --arg topic "$TOPIC" --arg name "$VERSION_NAME" --arg code "$VERSION_CODE" --arg notes "$NOTES" \
+            '{message:{topic:$topic, android:{priority:"high"}, data:{type:"update", versionName:$name, versionCode:$code, notes:$notes}}}')
           curl -sS --fail-with-body -X POST \
             -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
             "https://fcm.googleapis.com/v1/projects/$PROJECT/messages:send" -d "$BODY"
           echo
-          echo "Aviso enviado: versión $VERSION_NAME (código $VERSION_CODE)"
+          echo "Aviso enviado al topic $TOPIC: versión $VERSION_NAME (código $VERSION_CODE)"
